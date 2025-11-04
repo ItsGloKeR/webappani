@@ -1,0 +1,1087 @@
+import React, { useState, useEffect, useCallback, useMemo, Suspense, useRef } from 'react';
+import { Anime, StreamSource, StreamLanguage, SearchSuggestion, FilterState, MediaSort, AiringSchedule, MediaStatus, MediaSeason, EnrichedAiringSchedule, MediaFormat, PageInfo, RelatedAnime, RecommendedAnime } from './types';
+import { getHomePageData, getAnimeDetails, getGenreCollection, getSearchSuggestions, discoverAnime, getLatestEpisodes, getMultipleAnimeDetails, getRandomAnime, getAiringSchedule, setDataSaverMode } from './services/anilistService';
+import { addSearchTermToHistory } from './services/cacheService';
+import { getLastPlayerSettings, setLastPlayerSettings, getFullPlayerSettings } from './services/userPreferenceService';
+import Header from './components/Header';
+import Hero from './components/Hero';
+import AnimeCarousel from './components/AnimeCarousel';
+import AnimeGrid from './components/AnimeGrid';
+import LoadingSpinner from './components/LoadingSpinner';
+import Footer from './components/Footer';
+import BackToTopButton from './components/BackToTopButton';
+import VerticalAnimeList from './components/VerticalAnimeList';
+import { AdminProvider, useAdmin } from './contexts/AdminContext';
+import { TitleLanguageProvider } from './contexts/TitleLanguageContext';
+import { UserDataProvider, useUserData } from './contexts/UserDataContext';
+import { DataSaverProvider, useDataSaver } from './contexts/DataSaverContext';
+import { TooltipProvider } from './contexts/TooltipContext';
+import isEqual from 'lodash.isequal';
+import HomePageSkeleton from './components/HomePageSkeleton';
+import { progressTracker } from './utils/progressTracking';
+import { PLACEHOLDER_IMAGE_URL } from './constants';
+import { useDebounce } from './hooks/useDebounce';
+import AnimeDetailPageSkeleton from './components/AnimeDetailPageSkeleton';
+import Sidebar from './components/Sidebar';
+import FilterBar from './components/GenreFilter'; // Re-using GenreFilter file for FilterBar
+import Pagination from './components/SidebarMenu'; // Re-using SidebarMenu file for Pagination
+import LandingPageSkeleton from './components/LandingPageSkeleton';
+import { AuthProvider, useAuth } from './contexts/AuthContext';
+import { /* Removed: syncProgressOnLogin, */ } from './services/firebaseService';
+import { NotificationProvider } from './contexts/NotificationContext'; 
+import SchedulePreview from './components/SchedulePreview'; 
+
+const LandingPage = React.lazy(() => import('./components/LandingPage'));
+const AnimeDetailPage = React.lazy(() => import('./components/AnimeDetailPage'));
+const AnimePlayer = React.lazy(() => import('./components/AnimePlayer'));
+const SchedulePage = React.lazy(() => import('./components/SchedulePage'));
+const ImageSearchPage = React.lazy(() => import('./components/ImageSearchPage'));
+const AdminModal = React.lazy(() => import('./components/AdminModal'));
+const LoginModal = React.lazy(() => import('./components/LoginModal'));
+const ProfileModal = React.lazy(() => import('./components/ProfileModal'));
+const ReportPage = React.lazy(() => import('./components/ReportPage'));
+
+
+type View = 'home' | 'details' | 'player' | 'report' | 'schedule' | 'landing' | 'image-search';
+
+const initialFilters: FilterState = {
+    search: '',
+    genres: [],
+    year: '',
+    season: undefined,
+    formats: [],
+    statuses: [],
+    sort: MediaSort.POPULARITY_DESC,
+    scoreRange: [0, 100],
+    page: 1,
+};
+
+const FullPageSpinner: React.FC = () => (
+    <div className="h-screen flex items-center justify-center">
+        <LoadingSpinner />
+    </div>
+);
+
+const AppContent: React.FC = () => {
+    const { user, loading: authLoading } = useAuth();
+    const [view, setView] = useState<View>('landing');
+    const [trending, setTrending] = useState<Anime[]>([]);
+    const [popular, setPopular] = useState<Anime[]>([]);
+    const [topAiring, setTopAiring] = useState<Anime[]>([]);
+    const [topRated, setTopRated] = useState<Anime[]>([]);
+    const [topUpcoming, setTopUpcoming] = useState<Anime[]>([]);
+    const [popularThisSeason, setPopularThisSeason] = useState<Anime[]>([]);
+    const [latestEpisodes, setLatestEpisodes] = useState<EnrichedAiringSchedule[]>([]);
+    const [currentListViewAnime, setCurrentListViewAnime] = useState<Anime[]>([]); // Renamed from searchResults
+    const [pageInfo, setPageInfo] = useState<PageInfo | null>(null);
+    const [allGenres, setAllGenres] = useState<string[]>([]);
+    const [continueWatching, setContinueWatching] = useState<Anime[]>([]);
+    const [scheduleList, setScheduleList] = useState<AiringSchedule[]>([]);
+    
+    const [selectedAnime, setSelectedAnime] = useState<Anime | null>(null);
+    const [playerState, setPlayerState] = useState({
+        anime: null as Anime | null,
+        episode: 1,
+        source: StreamSource.Consumet,
+        language: StreamLanguage.Sub,
+    });
+    
+    const [isLoading, setIsLoading] = useState(true);
+    const [isDiscoverLoading, setIsDiscoverLoading] = useState(false);
+    const [searchTerm, setSearchTerm] = useState('');
+    const [filters, setFilters] = useState<FilterState>(initialFilters);
+    const [isListView, setIsListView] = useState(false);
+    const [isGeneratedList, setIsGeneratedList] = useState(false); // New state for lists populated directly
+    const [searchSuggestions, setSearchSuggestions] = useState<SearchSuggestion[]>([]);
+    const [isSuggestionsLoading, setIsSuggestionsLoading] = useState(false);
+    const [isAdminModalOpen, setIsAdminModalOpen] = useState(false);
+    const [isLoginModalOpen, setIsLoginModalOpen] = useState(false);
+    const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
+    const [currentSeason, setCurrentSeason] = useState<MediaSeason | null>(null);
+    const [currentYear, setCurrentYear] = useState<number | null>(null);
+    const [heroBannerUrl, setHeroBannerUrl] = useState<string | null>(null);
+    const [isBannerInView, setIsBannerInView] = useState(true);
+    const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+    const [isDiscoverViewForced, setIsDiscoverViewForced] = useState(false);
+    const [isFullSearchView, setIsFullSearchView] = useState(false);
+    const [discoverListTitle, setDiscoverListTitle] = useState('');
+    const [isScheduleVisibleOnHome, setIsScheduleVisibleOnHome] = useState(false);
+    const [isRandomLoading, setIsRandomLoading] = useState(false);
+    const schedulePreviewRef = useRef<HTMLDivElement>(null);
+    const prevHashRef = useRef<string>();
+    const seenEpisodeIds = useRef(new Set<number>());
+
+    const debouncedSuggestionsTerm = useDebounce(searchTerm, 300);
+    const { overrides } = useAdmin();
+    const { watchlist, favorites, reSync } = useUserData();
+    const { isDataSaverActive } = useDataSaver();
+
+    useEffect(() => {
+        // This effect runs AFTER the render, so prevHashRef will hold the value from before the current render.
+        prevHashRef.current = window.location.hash;
+    });
+
+    const generateDiscoverUrl = useCallback((currentFilters: FilterState): string => {
+        const params = new URLSearchParams();
+        const searchTerm = currentFilters.search.trim();
+        if (searchTerm) params.set('query', searchTerm);
+        if (currentFilters.genres.length > 0) params.set('genres', currentFilters.genres.join(','));
+        if (currentFilters.year) params.set('year', currentFilters.year);
+        if (currentFilters.season) params.set('season', currentFilters.season);
+        if (currentFilters.formats.length > 0) params.set('formats', currentFilters.formats.join(','));
+        if (currentFilters.statuses.length > 0) params.set('statuses', currentFilters.statuses.join(','));
+        if (currentFilters.sort !== MediaSort.POPULARITY_DESC) params.set('sort', currentFilters.sort);
+        if (currentFilters.page > 1) params.set('page', String(currentFilters.page));
+        
+        const queryString = params.toString();
+        return `#/discover${queryString ? `?${queryString}` : ''}`;
+    }, []);
+
+    useEffect(() => {
+        if (user) {
+            // When user logs in, set the progressTracker's userId to enable Firestore syncing.
+            // The actual data merging/syncing from Firestore to local storage happens in UserDataProvider.
+            progressTracker.setUserId(user.uid);
+            reSync(user); // Trigger re-sync in UserDataProvider
+        } else {
+            progressTracker.setUserId(null); // Clear userId on logout to stop Firestore syncing
+        }
+    }, [user, reSync]);
+
+
+    const hideTooltip = () => window.dispatchEvent(new CustomEvent('hideTooltip'));
+
+    useEffect(() => {
+        setDataSaverMode(isDataSaverActive);
+    }, [isDataSaverActive]);
+
+    const isDiscoveryView = useMemo(() => {
+        return !isEqual({ ...filters, page: 1 }, { ...initialFilters, page: 1 }) || isListView || isDiscoverViewForced;
+    }, [filters, isListView, isDiscoverViewForced]);
+    
+    const showFilterBar = isDiscoveryView && isFullSearchView;
+
+    useEffect(() => {
+        if (isSidebarOpen) {
+            document.body.classList.add('sidebar-open');
+        } else {
+            document.body.classList.remove('sidebar-open');
+        }
+    }, [isSidebarOpen]);
+
+    const handleEnterApp = (searchTerm?: string) => {
+        sessionStorage.setItem('hasVisitedAniGloK', 'true');
+        if (searchTerm) {
+            addSearchTermToHistory(searchTerm);
+            window.location.hash = generateDiscoverUrl({ ...initialFilters, search: searchTerm });
+        } else {
+            window.location.hash = '#/';
+        }
+    };
+    
+    const handleGoToLanding = () => {
+        window.location.hash = '#/landing';
+    };
+
+    const applyOverrides = useCallback((anime: Anime): Anime => {
+        if (!anime) return anime;
+        const overriddenTitle = overrides.anime[anime.anilistId]?.title;
+        return overriddenTitle ? { ...anime, englishTitle: overriddenTitle } : anime;
+    }, [overrides.anime]);
+
+    const applyOverridesToList = useCallback((list: Anime[]): Anime[] => {
+        return list.map(applyOverrides);
+    }, [applyOverrides]);
+
+    const handleSelectAnime = useCallback((anime: { anilistId: number }) => {
+        window.location.hash = `#/anime/${anime.anilistId}`;
+    }, []);
+    
+    const getStartEpisode = (anime: Anime, preferredEpisode?: number): number => {
+        if (preferredEpisode) {
+            return preferredEpisode;
+        }
+        const progressData = progressTracker.getMediaData(anime.anilistId);
+        return progressData?.last_episode_watched || 1;
+    };
+
+    const handleWatchNow = (anime: Anime | Partial<Anime>, episode?: number) => {
+        const startEpisode = getStartEpisode(anime as Anime, episode);
+        window.location.hash = `#/watch/${anime.anilistId}/${startEpisode}`;
+    };
+
+    const handlePlayerEpisodeChange = useCallback((ep: number) => {
+        if (playerState.anime) {
+            // Update the URL hash. The hashchange listener will handle the state update.
+            window.location.hash = `#/watch/${playerState.anime.anilistId}/${ep}`;
+        }
+    }, [playerState.anime]);
+
+    const handleSourceChange = useCallback((source: StreamSource) => {
+        setPlayerState(prev => {
+            const settings = getFullPlayerSettings();
+            const currentAnimeId = prev.anime?.anilistId;
+            let languageForNewSource: StreamLanguage;
+
+            if (currentAnimeId) {
+                languageForNewSource = settings.perAnimeLanguagePrefs?.[source]?.[currentAnimeId] || 
+                                       settings.languagePrefs[source] || 
+                                       StreamLanguage.Sub;
+            } else {
+                languageForNewSource = settings.languagePrefs[source] || StreamLanguage.Sub;
+            }
+            
+            const newState = { ...prev, source, language: languageForNewSource };
+            setLastPlayerSettings(source, languageForNewSource, prev.anime?.anilistId); 
+            return newState;
+        });
+    }, []);
+
+    const handleLanguageChange = useCallback((language: StreamLanguage) => {
+        setPlayerState(prev => {
+            // Save the new language preference for the current source, passing animeId
+            setLastPlayerSettings(prev.source, language, prev.anime?.anilistId);
+            return { ...prev, language };
+        });
+    }, []);
+
+    const loadContinueWatching = useCallback(async () => {
+        const progressData = progressTracker.getAllMediaData();
+        const inProgress = Object.values(progressData)
+            .sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+        if (inProgress.length === 0) {
+            setContinueWatching([]);
+            return;
+        }
+        const ids = inProgress.map(p => p.id);
+        const animeDetails = await getMultipleAnimeDetails(ids);
+        const animeDetailsMap = new Map(animeDetails.map(a => [a.anilistId, a]));
+        const sortedAnimeDetails = inProgress
+            .map(p => animeDetailsMap.get(p.id))
+            .filter((a): a is Anime => !!a)
+            .filter(a => !a.genres.includes("Hentai") && !a.isAdult);
+        setContinueWatching(applyOverridesToList(sortedAnimeDetails));
+    }, [applyOverridesToList]);
+
+    useEffect(() => {
+        progressTracker.init();
+        const handleProgressUpdate = () => {
+            if (view !== 'landing') {
+                loadContinueWatching();
+            }
+        };
+        window.addEventListener('progressUpdated', handleProgressUpdate);
+        return () => window.removeEventListener('progressUpdated', handleProgressUpdate);
+    }, [view, loadContinueWatching]);
+
+    useEffect(() => {
+        if (view !== 'landing') {
+          loadContinueWatching();
+        }
+    }, [view, loadContinueWatching]);
+
+
+    // URL Hash Routing
+    useEffect(() => {
+        const handleRouteChange = async () => {
+            hideTooltip();
+            setIsScheduleVisibleOnHome(false);
+            const hash = window.location.hash;
+
+            if (hash === '#/landing') {
+                if(view !== 'landing') setView('landing');
+                return;
+            }
+
+            if (!sessionStorage.getItem('hasVisitedAniGloK') && !/#\/(anime|watch|report|schedule|list|discover|image-search)/.test(hash)) {
+                window.location.hash = '#/landing';
+                return;
+            }
+
+            const imageSearchMatch = hash.match(/^#\/image-search/);
+            if (imageSearchMatch) {
+                if (view === 'image-search') return;
+                setView('image-search');
+                setCurrentListViewAnime([]);
+                setIsListView(false);
+                setIsGeneratedList(false);
+                window.scrollTo(0, 0);
+                return;
+            }
+
+            const animeDetailsMatch = hash.match(/^#\/anime\/(\d+)/);
+            if (animeDetailsMatch) {
+                const animeId = parseInt(animeDetailsMatch[1], 10);
+                if (view === 'details' && selectedAnime?.anilistId === animeId) return;
+
+                setIsLoading(true);
+                setView('details');
+                setCurrentListViewAnime([]); // Clear any existing list view
+                setIsListView(false);
+                setIsGeneratedList(false); // Not a generated list
+                window.scrollTo(0, 0);
+                try {
+                    const fullDetails = await getAnimeDetails(animeId);
+                    setSelectedAnime(applyOverrides(fullDetails));
+                } catch (error) {
+                    console.error("Failed to get anime details:", error);
+                    window.location.hash = '#/';
+                } finally {
+                    setIsLoading(false);
+                }
+                return;
+            }
+
+            const watchMatch = hash.match(/^#\/watch\/(\d+)\/(\d+)/);
+            if (watchMatch) {
+                const animeId = parseInt(watchMatch[1], 10);
+                const episode = parseInt(watchMatch[2], 10);
+                
+                // Optimization: If we're already on the player for the same anime, just update the episode.
+                if (view === 'player' && playerState.anime?.anilistId === animeId) {
+                    if (playerState.episode !== episode) {
+                        setPlayerState(prev => ({ ...prev, episode: episode }));
+                    }
+                    return; // Prevent full re-fetch
+                }
+
+                // This is now the "cold load" path for the player page
+                setView('player');
+                setPlayerState(prev => ({ ...prev, anime: null }));
+                setCurrentListViewAnime([]); // Clear any existing list view
+                setIsListView(false);
+                setIsGeneratedList(false); // Not a generated list
+                window.scrollTo(0, 0);
+                try {
+                    const fullAnimeDetails = await getAnimeDetails(animeId);
+                    progressTracker.addToHistory(fullAnimeDetails);
+                    const lastSettings = getLastPlayerSettings(animeId);
+                    setPlayerState({
+                        anime: applyOverrides(fullAnimeDetails),
+                        episode: episode,
+                        source: lastSettings.source,
+                        language: lastSettings.language,
+                    });
+                } catch (err) {
+                    console.error("Could not fetch player details", err);
+                    window.location.hash = '#/';
+                }
+                return;
+            }
+
+            const reportMatch = hash.match(/^#\/report/);
+            if (reportMatch) {
+                if (view === 'report') return;
+                setView('report');
+                setCurrentListViewAnime([]); // Clear any existing list view
+                setIsListView(false);
+                setIsGeneratedList(false); // Not a generated list
+                window.scrollTo(0, 0);
+                return;
+            }
+            
+            const scheduleMatch = hash.match(/^#\/schedule/);
+            if (scheduleMatch) {
+                if (view === 'schedule') return;
+                setView('schedule');
+                setCurrentListViewAnime([]); // Clear any existing list view
+                setIsListView(false);
+                setIsGeneratedList(false); // Not a generated list
+                window.scrollTo(0, 0);
+                return;
+            }
+
+            const generatedListMatch = hash.match(/^#\/list\/generated\/(.+)/);
+            if (generatedListMatch) {
+                const encodedTitle = generatedListMatch[1];
+                const decodedTitle = decodeURIComponent(encodedTitle);
+                
+                setDiscoverListTitle(decodedTitle);
+                setIsFullSearchView(false);
+                setIsListView(true);
+                setIsGeneratedList(true); // Flag this as a generated list
+                setFilters(initialFilters); // Clear filters to avoid discover effect interference
+                setPageInfo(null);
+                setSelectedAnime(null);
+                if (view !== 'home') setView('home');
+                window.scrollTo(0, 0);
+                // IMPORTANT: Do NOT touch currentListViewAnime here. It's already populated by handleViewMore.
+                return;
+            }
+
+            const predefinedListMatch = hash.match(/^#\/list\/(watchlist|favorites|continue-watching)/);
+            if (predefinedListMatch) {
+                const listType = predefinedListMatch[1] as 'watchlist' | 'favorites' | 'continue-watching';
+    
+                const titleMap = {
+                    'watchlist': 'My Watchlist',
+                    'favorites': 'My Favorites',
+                    'continue-watching': 'Continue Watching'
+                };
+                const newTitle = titleMap[listType];
+    
+                if (view === 'home' && isListView && discoverListTitle === newTitle && !isGeneratedList) {
+                    return;
+                }
+    
+                setDiscoverListTitle(newTitle);
+                setIsFullSearchView(false);
+                setIsDiscoverLoading(true);
+                setIsListView(true);
+                setIsGeneratedList(false); // Not a generated list
+                setPageInfo(null);
+                setView('home');
+                setSelectedAnime(null);
+                window.scrollTo(0, 0);
+    
+                let animeToDisplay: Anime[] = [];
+                if (listType === 'watchlist') {
+                    if (watchlist.length > 0) {
+                        animeToDisplay = await getMultipleAnimeDetails(watchlist);
+                    }
+                } else if (listType === 'favorites') {
+                    if (favorites.length > 0) {
+                        animeToDisplay = await getMultipleAnimeDetails(favorites);
+                    }
+                } else if (listType === 'continue-watching') {
+                    animeToDisplay = continueWatching;
+                }
+                
+                setCurrentListViewAnime(applyOverridesToList(animeToDisplay)); // Changed from setSearchResults
+                setIsDiscoverLoading(false);
+                return;
+            }
+
+            const discoverMatch = hash.match(/^#\/discover/);
+            if (discoverMatch) {
+                const params = new URLSearchParams(hash.split('?')[1] || '');
+                const newFilters: FilterState = {
+                    search: params.get('query') || '',
+                    genres: params.get('genres')?.split(',').filter(Boolean) || [],
+                    year: params.get('year') || '',
+                    season: (params.get('season') as MediaSeason) || undefined,
+                    formats: (params.get('formats')?.split(',').filter(Boolean) as MediaFormat[]) || [],
+                    statuses: (params.get('statuses')?.split(',').filter(Boolean) as MediaStatus[]) || [],
+                    sort: (params.get('sort') as MediaSort) || MediaSort.POPULARITY_DESC,
+                    scoreRange: [0, 100], // Not in URL for now
+                    page: parseInt(params.get('page') || '1', 10),
+                };
+
+                if (!isEqual(newFilters, filters)) {
+                    // FIX: When filters change, immediately show a loading state
+                    // and clear old results to prevent showing stale data during debounce.
+                    setIsDiscoverLoading(true);
+                    setCurrentListViewAnime([]);
+                    setFilters(newFilters);
+                }
+                
+                setIsDiscoverViewForced(true);
+                setIsFullSearchView(true);
+                
+                if (newFilters.search) {
+                    setDiscoverListTitle(`Search results for: "${newFilters.search}"`);
+                } else {
+                    setDiscoverListTitle('Filtered Results');
+                }
+                
+                setIsListView(false);
+                setIsGeneratedList(false); // Not a generated list
+                setSelectedAnime(null);
+                if (view !== 'home') setView('home');
+                
+                return;
+            }
+
+
+            // Default Route: Home
+            if ((hash === '' || hash === '#/') && !sessionStorage.getItem('hasVisitedAniGloK')) {
+                window.location.hash = '#/landing';
+                return;
+            }
+            
+            // Only reset if we are genuinely navigating to home and it's not a generated list already being displayed
+            if (view !== 'home' || isDiscoveryView || isListView || isDiscoverViewForced || isGeneratedList) {
+                setSearchTerm('');
+                setFilters(initialFilters);
+                setCurrentListViewAnime([]); // Changed from setSearchResults
+                setPageInfo(null);
+                setSelectedAnime(null);
+                setIsBannerInView(true);
+                setIsListView(false);
+                setIsDiscoverViewForced(false);
+                setIsFullSearchView(false);
+                setDiscoverListTitle('');
+                setIsGeneratedList(false); // Reset this flag when going back to true home
+                setView('home');
+                window.scrollTo(0, 0);
+            }
+        };
+
+        window.addEventListener('hashchange', handleRouteChange);
+        handleRouteChange(); // Handle initial route
+
+        return () => {
+            window.removeEventListener('hashchange', handleRouteChange);
+        };
+    }, [applyOverrides, view, isDiscoveryView, selectedAnime, playerState.anime, playerState.episode, filters, watchlist, favorites, continueWatching, discoverListTitle, generateDiscoverUrl, applyOverridesToList, isListView, isGeneratedList]);
+
+
+    useEffect(() => {
+        const fetchInitialData = async () => {
+            setIsLoading(true);
+            try {
+                const [{ trending, popular, topAiring, topRated, topUpcoming, popularThisSeason, currentSeason, currentYear }, genres, latest, schedules] = await Promise.all([
+                    getHomePageData(),
+                    getGenreCollection(),
+                    getLatestEpisodes(),
+                    getAiringSchedule()
+                ]);
+                setTrending(applyOverridesToList(trending));
+                setPopular(applyOverridesToList(popular));
+                setTopAiring(applyOverridesToList(topAiring));
+                setTopRated(applyOverridesToList(topRated));
+                setTopUpcoming(applyOverridesToList(topUpcoming));
+                setPopularThisSeason(applyOverridesToList(popularThisSeason));
+                setAllGenres(genres);
+                setLatestEpisodes(latest);
+                latest.forEach(ep => seenEpisodeIds.current.add(ep.id));
+                setScheduleList(schedules);
+                setCurrentSeason(currentSeason);
+                setCurrentYear(currentYear);
+            } catch (error) {
+                console.error("Failed to fetch home page data:", error);
+            } finally {
+                setIsLoading(false);
+            }
+        };
+        if (view !== 'landing' && (view === 'home' || view === 'schedule' || view === 'image-search') && trending.length === 0) {
+          fetchInitialData();
+        }
+    }, [applyOverridesToList, view, trending.length]);
+
+    useEffect(() => {
+        setTrending(list => applyOverridesToList(list));
+        setPopular(list => applyOverridesToList(list));
+        setTopAiring(list => applyOverridesToList(list));
+        setTopRated(list => applyOverridesToList(list));
+        setTopUpcoming(list => applyOverridesToList(list));
+        setPopularThisSeason(list => applyOverridesToList(list));
+        setCurrentListViewAnime(list => applyOverridesToList(list)); // Changed from setSearchResults
+        setSelectedAnime(prev => prev ? applyOverrides(prev) : null);
+    }, [overrides, applyOverridesToList, applyOverrides]);
+
+    const debouncedFilters = useDebounce(filters, 500);
+
+    useEffect(() => {
+        // Only run discover if it's not a generated list AND it's a discovery view
+        if (isGeneratedList || !isDiscoveryView || isListView) {
+            return;
+        }
+
+        const performSearch = async () => {
+            setIsDiscoverLoading(true);
+            try {
+                const { results, pageInfo: newPageInfo } = await discoverAnime(debouncedFilters);
+                setCurrentListViewAnime(applyOverridesToList(results)); // Changed from setSearchResults
+                setPageInfo(newPageInfo);
+            } catch (error) {
+                console.error("Failed to discover anime:", error);
+                setCurrentListViewAnime([]); // Changed from setSearchResults
+                setPageInfo(null);
+            } finally {
+                setIsDiscoverLoading(false);
+            }
+        };
+        performSearch();
+    }, [debouncedFilters, isDiscoveryView, applyOverridesToList, isListView, isGeneratedList]);
+    
+    useEffect(() => {
+        if (debouncedSuggestionsTerm.trim() === '') {
+            setSearchSuggestions([]);
+            return;
+        }
+        const fetchSuggestions = async () => {
+            setIsSuggestionsLoading(true);
+            try {
+                const results = await getSearchSuggestions(debouncedSuggestionsTerm);
+                setSearchSuggestions(results);
+            } catch (error) {
+                console.error("Failed to fetch search suggestions:", error);
+            } finally {
+                setIsSuggestionsLoading(false);
+            }
+        };
+        fetchSuggestions();
+    }, [debouncedSuggestionsTerm]);
+
+    const handleRandomAnime = async () => {
+        if (isRandomLoading) return;
+        hideTooltip();
+        setIsRandomLoading(true);
+        try {
+            const randomAnime = await getRandomAnime();
+            if (randomAnime) {
+                handleSelectAnime(randomAnime);
+            }
+        } catch (error) {
+            console.error("Failed to get random anime:", error);
+        } finally {
+            setIsRandomLoading(false);
+        }
+    }
+    
+    const handleSearchInputChange = (term: string) => setSearchTerm(term);
+
+    const handleSearchSubmit = () => {
+        hideTooltip();
+        const termToSubmit = searchTerm.trim();
+        if (termToSubmit === '') return;
+        addSearchTermToHistory(termToSubmit);
+        
+        window.location.hash = generateDiscoverUrl({ ...initialFilters, search: termToSubmit, page: 1 });
+
+        setSearchTerm('');
+        setSearchSuggestions([]);
+        const activeElement = document.activeElement as HTMLElement;
+        if (activeElement) activeElement.blur();
+    };
+
+    const handleSuggestionClick = (anime: { anilistId: number }) => {
+        hideTooltip();
+        setSearchTerm(''); 
+        setSearchSuggestions([]);
+        handleSelectAnime(anime);
+    };
+    
+    const handleContinueWatching = (anime: Anime) => {
+        const progressData = progressTracker.getMediaData(anime.anilistId);
+        const lastEpisode = progressData?.last_episode_watched || 1;
+        handleWatchNow(anime, lastEpisode);
+    };
+
+    const handleRemoveFromContinueWatching = (animeId: number) => {
+        progressTracker.removeFromHistory(animeId);
+    };
+    
+    const handleBackFromDetails = () => {
+        window.history.back();
+    };
+
+    const handleGoToReport = useCallback(() => {
+        window.location.hash = '#/report';
+    }, []);
+
+    const handleBackFromReport = () => {
+        window.history.back();
+    };
+    
+    const handleGoToAppHome = useCallback(() => {
+        window.location.hash = '#/';
+    }, []);
+
+    const handleScheduleClick = () => {
+        hideTooltip();
+        setIsSidebarOpen(false);
+        window.location.hash = '#/schedule';
+    }
+
+    const handleImageSearchClick = useCallback(() => {
+        hideTooltip();
+        window.location.hash = '#/image-search';
+    }, []);
+
+    const handleBackFromImageSearch = () => {
+        window.history.back();
+    };
+
+    const handleLoginClick = () => {
+        hideTooltip();
+        setIsLoginModalOpen(true);
+    };
+    
+    const handleOpenDiscoverView = () => {
+        hideTooltip();
+        window.location.hash = generateDiscoverUrl({ ...filters, search: '', page: 1 });
+    };
+
+    const handleBackToDetails = () => {
+        if (playerState.anime) {
+            window.location.hash = `#/anime/${playerState.anime.anilistId}`;
+        } else {
+            window.history.back();
+        }
+    };
+
+    const handleViewMore = useCallback(async (partialFilters: Partial<FilterState> & { list?: 'watchlist' | 'favorites' | 'continue-watching', animeList?: (RelatedAnime | RecommendedAnime)[] }, title: string) => {
+        hideTooltip();
+        setIsSidebarOpen(false); // Ensure sidebar is closed for list views
+    
+        if (partialFilters.list) {
+            window.location.hash = `#/list/${partialFilters.list}`;
+            return;
+        }
+        
+        if (partialFilters.animeList) {
+            const animeListAsAnime: Anime[] = partialFilters.animeList.map((item: RelatedAnime | RecommendedAnime) => ({
+                anilistId: item.id,
+                englishTitle: item.englishTitle,
+                romajiTitle: item.romajiTitle,
+                coverImage: item.coverImage,
+                isAdult: item.isAdult,
+                episodes: item.episodes,
+                totalEpisodes: item.episodes, // Assuming totalEpisodes is same as episodes for these partial types
+                format: item.format,
+                year: item.year,
+                // Default values for fields not present in RelatedAnime/RecommendedAnime
+                malId: undefined, // Not available
+                description: '', // Not available
+                coverImageColor: undefined, // Not available
+                bannerImage: '', // Not available
+                genres: [], // Not available
+                duration: null, // Not available
+                rating: 0, // Not available
+                status: 'FINISHED', // Defaulting to FINISHED as most related/recommended are complete
+                studios: [], // Not available
+                staff: [], // Not available
+                characters: [], // Not available
+                relations: [], // Not available
+                recommendations: [],
+            }));
+
+            if (animeListAsAnime.length === 0) {
+                console.error("handleViewMore: No anime items were mapped for the list display.");
+            }
+            
+            setCurrentListViewAnime(applyOverridesToList(animeListAsAnime)); // SET THE DATA HERE
+            setDiscoverListTitle(title);
+            setIsFullSearchView(false);
+            setIsDiscoverLoading(false); // No actual loading needed for pre-populated list
+            setIsListView(true);
+            setIsGeneratedList(true); // Signal this is a pre-populated list
+            setFilters(initialFilters); // Reset filters to ensure clean state
+            setPageInfo(null);
+            setView('home');
+            window.scrollTo(0, 0);
+
+            // Change hash AFTER setting state, so handleRouteChange can verify it
+            window.location.hash = `#/list/generated/${encodeURIComponent(title)}`;
+
+        } else {
+            const newFilters = { ...initialFilters, ...partialFilters, page: 1 };
+            window.location.hash = generateDiscoverUrl(newFilters);
+        }
+    }, [applyOverridesToList, generateDiscoverUrl]);
+
+
+    const handleFilterBarChange = (newFilters: FilterState) => {
+        const hasFilterChanged = !isEqual(
+            { ...filters, page: 1 }, 
+            { ...newFilters, page: 1 }
+        );
+        const finalFilters = hasFilterChanged ? { ...newFilters, page: 1 } : newFilters;
+        window.location.hash = generateDiscoverUrl(finalFilters);
+    };
+
+    const handlePageChange = (newPage: number) => {
+        window.location.hash = generateDiscoverUrl({ ...filters, page: newPage });
+        window.scrollTo(0, 0);
+    };
+
+    const handleCloseScheduleOnHome = () => {
+        setIsScheduleVisibleOnHome(false);
+        requestAnimationFrame(() => {
+            if (schedulePreviewRef.current) {
+                const headerOffset = 100; // approx height of header
+                const elementPosition = schedulePreviewRef.current.getBoundingClientRect().top;
+                const offsetPosition = elementPosition + window.pageYOffset - headerOffset;
+
+                window.scrollTo({
+                    top: offsetPosition,
+                    behavior: 'auto'
+                });
+            }
+        });
+    };
+
+    const latestEpisodesAsAnime = useMemo(() => latestEpisodes.map(schedule => ({
+        anilistId: schedule.media.id,
+        englishTitle: schedule.media.title.english || schedule.media.title.romaji,
+        romajiTitle: schedule.media.title.romaji || schedule.media.title.english,
+        coverImage: (schedule.media.coverImage as any).large || (schedule.media.coverImage as any).medium || PLACEHOLDER_IMAGE_URL,
+        isAdult: schedule.media.isAdult,
+        episodes: schedule.episode,
+        totalEpisodes: schedule.media.episodes || null,
+        description: (schedule.media as any).description || '', 
+        bannerImage: '', 
+        genres: schedule.media.genres || [], 
+        duration: null, 
+        year: (schedule.media as any).seasonYear || 0,
+        rating: 0, 
+        status: 'RELEASING', 
+        format: (schedule.media as any).format || '', 
+        studios: [], 
+        staff: [], 
+        characters: [], 
+        relations: [], 
+        recommendations: [],
+    })), [latestEpisodes]);
+    
+    const iconProps = { className: "h-7 w-7" };
+    const smallIconProps = { className: "h-5 w-5 text-cyan-400" };
+
+    const ContinueWatchingIcon = <svg {...iconProps} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.414-1.415L11 9.586V6z" clipRule="evenodd" /></svg>;
+    const TrendingIcon = <svg {...iconProps} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M12.84 3.49a1 1 0 011.118 1.666l-2.863 4.312a1 1 0 00.325 1.488l4.463 2.231a1 1 0 01.554 1.326l-2.04 4.081a1 1 0 01-1.78-.9l1.297-2.592-3.125-1.562a3 3 0 01-.975-4.464L12.84 3.49zM6.86 3.49a1 1 0 011.118 1.666l-2.863 4.312a1 1 0 00.325 1.488l4.463 2.231a1 1 0 01.554 1.326l-2.04 4.081a1 1 0 01-1.78-.9l1.297-2.592-3.125-1.562a3 3 0 01-.975-4.464L6.86 3.49z" clipRule="evenodd" /></svg>;
+    const LatestEpisodeIcon = <svg {...iconProps} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M4 3a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V5a2 2 0 00-2-2H4zm1 4a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1zm10 0a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" /></svg>;
+    const PopularIcon = <svg {...iconProps} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path d="M11 2a1 1 0 10-2 0v1a1 1 0 102 0V2zM5 5a1 1 0 011-1h8a1 1 0 110 2H6a1 1 0 01-1-1zm3 8a1 1 0 011-1h2a1 1 0 110 2H9a1 1 0 01-1-1zm-3 4a1 1 0 100 2h8a1 1 0 100-2H5z" /><path fillRule="evenodd" d="M3 5a3 3 0 013-3h8a3 3 0 013 3v12a1 1 0 11-2 0V5a1 1 0 00-1-1H6a1 1 0 00-1 1v12a1 1 0 11-2 0V5z" clipRule="evenodd" /></svg>;
+    const UpcomingIcon = <svg {...iconProps} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M6 2a1 1 0 00-1 1v1H4a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-1V3a1 1 0 10-2 0v1H7V3a1 1 0 00-1-1zm0 5a1 1 0 000 2h8a1 1 0 100-2H6z" clipRule="evenodd" /></svg>;
+    const SeasonIcon = <svg {...iconProps} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M5 2a1 1 0 00-1 1v1H3a1 1 0 000 2h1v1a1 1 0 001 1h12a1 1 0 001-1V6h1a1 1 0 100-2h-1V3a1 1 0 00-1-1H5zM4 9a1 1 0 011-1h10a1 1 0 110 2H5a1 1 0 01-1-1zm2 3a1 1 0 100 2h8a1 1 0 100-2H6z" clipRule="evenodd" /></svg>;
+    const AiringIcon = <svg {...smallIconProps} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path d="M9.99 2.05c.53 0 1.04 .08 1.54 .23l-1.28 1.28A5.95 5.95 0 004.28 7.5l-1.28 1.28A7.94 7.94 0 019.99 2.05zM2.06 9.99a7.94 7.94 0 016.71-7.71l-1.28 1.28A5.95 5.95 0 003.5 12.5l-1.28 1.28A7.94 7.94 0 012.06 10zM10 4a6 6 0 100 12 6 6 0 000-12zM10 14a4 4 0 110-8 4 4 0 010 8z" /></svg>;
+    const RatedIcon = <svg {...smallIconProps} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8-2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z" /></svg>;
+
+    const renderHomePage = () => {
+        if (isDiscoveryView) {
+            let title = discoverListTitle;
+            if (isFullSearchView) {
+                if(filters.search) {
+                    title = `Search results for: "${filters.search}"`;
+                } else {
+                    title = 'Filtered Results';
+                }
+            }
+            if (isListView) { // watchlist/favorites are special cases of list view
+                title = discoverListTitle;
+            }
+
+            return (
+                <main className="container mx-auto max-w-screen-2xl p-4 md:p-8">
+                    {showFilterBar && (
+                        <FilterBar
+                            filters={filters}
+                            onFiltersChange={handleFilterBarChange}
+                            allGenres={allGenres}
+                            onReset={() => { setFilters(initialFilters); window.location.hash = '#/'; }}
+                        />
+                    )}
+                    <AnimeGrid
+                        title={title}
+                        resultsCount={isListView ? currentListViewAnime.length : pageInfo?.total}
+                        animeList={currentListViewAnime} // Changed from searchResults
+                        onSelectAnime={handleSelectAnime}
+                        isLoading={isDiscoverLoading}
+                        onBackClick={handleGoToAppHome}
+                    />
+                    {pageInfo && pageInfo.lastPage > 1 && !isDiscoverLoading && (
+                        <Pagination
+                            currentPage={pageInfo.currentPage}
+                            totalPages={pageInfo.lastPage}
+                            onPageChange={handlePageChange}
+                        />
+                    )}
+                </main>
+            );
+        }
+
+        if (isScheduleVisibleOnHome) {
+            return (
+                 <main className="container mx-auto max-w-screen-2xl p-4 md:p-8">
+                    <Suspense fallback={<FullPageSpinner />}>
+                        <SchedulePage 
+                            schedule={scheduleList}
+                            onSelectAnime={handleSelectAnime} 
+                            onClose={handleCloseScheduleOnHome} 
+                        />
+                    </Suspense>
+                </main>
+            );
+        }
+
+        return (
+            <main>
+                <Hero animes={trending} onWatchNow={handleWatchNow} onDetails={handleSelectAnime} onBannerChange={setHeroBannerUrl} setInView={setIsBannerInView} />
+                <div className="container mx-auto max-w-screen-2xl p-4 md:p-8">
+                    {continueWatching.length > 0 && (
+                        <div className="mb-12">
+                            <AnimeCarousel 
+                                title="Continue Watching"
+                                icon={ContinueWatchingIcon}
+                                animeList={continueWatching} 
+                                onSelectAnime={handleContinueWatching}
+                                showRank={false}
+                                onRemoveItem={handleRemoveFromContinueWatching}
+                                isCollapsible={true}
+                            />
+                        </div>
+                    )}
+                    <div className="mb-4">
+                        <AnimeCarousel 
+                            title="Trending" 
+                            icon={TrendingIcon}
+                            animeList={trending} 
+                            onSelectAnime={handleSelectAnime}
+                            onViewMore={() => handleViewMore({ sort: MediaSort.TRENDING_DESC }, "Trending Anime")}
+                        />
+                    </div>
+                </div>
+
+                <div className="container mx-auto max-w-screen-2xl p-4 md:p-8">
+                    <div className="grid grid-cols-1 lg:grid-cols-4 gap-8">
+                        <div className="lg:col-span-3 flex flex-col gap-12">
+                             <AnimeCarousel
+                                title="Latest Episodes"
+                                icon={LatestEpisodeIcon}
+                                animeList={latestEpisodesAsAnime}
+                                onSelectAnime={handleSelectAnime}
+                                onViewMore={() => handleViewMore({ statuses: [MediaStatus.RELEASING], sort: MediaSort.START_DATE_DESC }, "Recently Released Anime")}
+                                showRank={false}
+                                cardSize="small"
+                            />
+                            <AnimeCarousel 
+                                title="All Time Popular"
+                                icon={PopularIcon}
+                                animeList={popular}
+                                onSelectAnime={handleSelectAnime}
+                                onViewMore={() => handleViewMore({ sort: MediaSort.POPULARITY_DESC }, "All Time Popular Anime")}
+                                showRank={false}
+                            />
+                            <AnimeCarousel 
+                                title="Top Upcoming" 
+                                icon={UpcomingIcon}
+                                animeList={topUpcoming} 
+                                onSelectAnime={handleSelectAnime}
+                                showRank={false}
+                                onViewMore={() => handleViewMore({ statuses: [MediaStatus.NOT_YET_RELEASED], sort: MediaSort.POPULARITY_DESC }, "Top Upcoming Anime")}
+                                cardSize="small"
+                            />
+                            <div className="mt-4">
+                                <AnimeCarousel 
+                                    title="Popular This Season"
+                                    icon={SeasonIcon}
+                                    animeList={popularThisSeason} 
+                                    onSelectAnime={handleSelectAnime}
+                                    showRank={false}
+                                    onViewMore={() => handleViewMore({ season: currentSeason!, year: String(currentYear!), sort: MediaSort.POPULARITY_DESC }, "Popular This Season")}
+                                    cardSize="small"
+                                />
+                            </div>
+                        </div>
+                        <div className="lg:col-span-1">
+                            <div className="flex flex-col gap-8">
+                                <VerticalAnimeList 
+                                    title="Top Airing" 
+                                    animeList={topAiring} 
+                                    // FIX: Changed onSelectRelated to handleSelectAnime as onSelectRelated is not defined in this scope.
+                                    onSelectAnime={handleSelectAnime}
+                                    onViewMore={() => handleViewMore({ statuses: [MediaStatus.RELEASING], sort: MediaSort.POPULARITY_DESC }, "Top Airing Anime")}
+                                    icon={AiringIcon}
+                                    showRank={true}
+                                />
+                                <VerticalAnimeList 
+                                    title="Top Rated" 
+                                    animeList={topRated} 
+                                    onSelectAnime={handleSelectAnime}
+                                    onViewMore={() => handleViewMore({ sort: MediaSort.SCORE_DESC }, "Top Rated Anime")}
+                                    icon={RatedIcon}
+                                    showRank={true}
+                                />
+                            </div>
+                        </div>
+                    </div>
+                    <div ref={schedulePreviewRef} className="mt-16">
+                         <SchedulePreview schedule={scheduleList} onSelectAnime={handleSelectAnime} onShowMore={() => setIsScheduleVisibleOnHome(true)} />
+                    </div>
+                </div>
+            </main>
+        );
+    };
+
+    if (authLoading && view !== 'landing') {
+        return <HomePageSkeleton />;
+    }
+    
+    return (
+        <TooltipProvider onWatchNow={handleWatchNow} onDetails={handleSelectAnime}>
+            {view !== 'landing' && (
+                <Sidebar 
+                    isOpen={isSidebarOpen} 
+                    onClose={() => setIsSidebarOpen(false)} 
+                    onNavigate={handleViewMore}
+                    onHomeClick={handleGoToAppHome}
+                    onScheduleClick={handleScheduleClick}
+                    onLoginClick={handleLoginClick}
+                    onProfileClick={() => setIsProfileModalOpen(true)}
+                    onRandomAnime={handleRandomAnime}
+                    isRandomLoading={isRandomLoading}
+                    allGenres={allGenres}
+                    isHome={view === 'home' && !isDiscoveryView}
+                />
+            )}
+            {view !== 'landing' && (
+                <Header 
+                    onSearch={handleSearchInputChange}
+                    onLogoClick={handleGoToAppHome}
+                    onMenuClick={() => setIsSidebarOpen(true)}
+                    onFilterClick={handleOpenDiscoverView}
+                    onRandomAnime={handleRandomAnime}
+                    isRandomLoading={isRandomLoading}
+                    onLoginClick={handleLoginClick}
+                    onProfileClick={() => setIsProfileModalOpen(true)}
+                    onSearchSubmit={handleSearchSubmit}
+                    searchTerm={searchTerm}
+                    suggestions={searchSuggestions}
+                    onSuggestionClick={handleSuggestionClick}
+                    isSuggestionsLoading={isSuggestionsLoading}
+                    onNavigate={handleViewMore}
+                    isBannerInView={isBannerInView || view === 'details'}
+                    onImageSearchClick={handleImageSearchClick}
+                />
+            )}
+            
+            <Suspense fallback={view === 'landing' ? <LandingPageSkeleton /> : <FullPageSpinner />}>
+                {view === 'landing' && <LandingPage onEnter={handleEnterApp} onLogoClick={handleGoToAppHome} onNavigate={handleViewMore}/>}
+                
+                {view === 'home' && (isLoading && !isDiscoveryView ? <HomePageSkeleton /> : renderHomePage())}
+
+                {view === 'details' && (isLoading || !selectedAnime ? <AnimeDetailPageSkeleton /> : <AnimeDetailPage anime={selectedAnime} onWatchNow={handleWatchNow} onBack={handleBackFromDetails} onSelectRelated={(id) => handleSelectAnime({ anilistId: id })} onViewMore={handleViewMore} setInView={setIsBannerInView} />)}
+
+                {view === 'player' && (!playerState.anime ? <FullPageSpinner /> : <AnimePlayer anime={playerState.anime} currentEpisode={playerState.episode} currentSource={playerState.source} currentLanguage={playerState.language} onEpisodeChange={handlePlayerEpisodeChange} onSourceChange={handleSourceChange} onLanguageChange={handleLanguageChange} onSelectRelated={handleSelectAnime} onSelectRecommended={handleSelectAnime} onViewMore={handleViewMore} onReportIssue={handleGoToReport} topAiring={topAiring} onBack={handleBackToDetails} />)}
+
+                {view === 'report' && <ReportPage onBack={handleBackFromReport} />}
+
+                {view === 'schedule' && (isLoading ? <FullPageSpinner /> : <SchedulePage schedule={scheduleList} onSelectAnime={handleSelectAnime} onClose={handleGoToAppHome} />)}
+                
+                {view === 'image-search' && <ImageSearchPage onBack={handleBackFromImageSearch} onSelectAnime={handleSelectAnime} />}
+            </Suspense>
+
+            {view !== 'landing' && <Footer onNavigate={handleViewMore} onLogoClick={handleGoToAppHome} isDataSaverActive={isDataSaverActive} />}
+            {view !== 'landing' && <BackToTopButton />}
+            
+            {/* Modals */}
+            <Suspense fallback={null}>
+                {isAdminModalOpen && <AdminModal isOpen={isAdminModalOpen} onClose={() => setIsAdminModalOpen(false)} />}
+                {isLoginModalOpen && <LoginModal isOpen={isLoginModalOpen} onClose={() => setIsLoginModalOpen(false)} />}
+                {isProfileModalOpen && <ProfileModal isOpen={isProfileModalOpen} onClose={() => setIsProfileModalOpen(false)} onOpenAdminPanel={() => setIsAdminModalOpen(true)} />}
+            </Suspense>
+
+        </TooltipProvider>
+    );
+};
+
+const App: React.FC = () => {
+  return (
+    <AuthProvider>
+      <DataSaverProvider>
+        <AdminProvider>
+            <UserDataProvider>
+                <TitleLanguageProvider>
+                    <NotificationProvider> 
+                        <AppContent />
+                    </NotificationProvider>
+                </TitleLanguageProvider>
+            </UserDataProvider>
+        </AdminProvider>
+      </DataSaverProvider>
+    </AuthProvider>
+  );
+};
+
+export default App;
